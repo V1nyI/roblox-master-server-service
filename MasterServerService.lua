@@ -12,7 +12,7 @@ local function ComputeServerKey()
 	if game.JobId and game.JobId ~= "" then
 		return game.JobId
 	end
-	
+
 	if game.PrivateServerId and game.PrivateServerId ~= "" then
 		return "PS_"..game.PrivateServerId
 	end
@@ -20,7 +20,7 @@ local function ComputeServerKey()
 end
 
 local ServerKey = ComputeServerKey()
-local EntryLifetimeSeconds = 2e6
+local EntryLifetimeSeconds = 13
 local MaxServers = 10
 
 local TopicElection = "MasterServerService.Election"..STUDIO_SUFFIX
@@ -34,9 +34,10 @@ local ServerListName = "MasterServerServiceList"..STUDIO_SUFFIX
 local AuditDataStoreName = "MasterServerServiceAudit"..STUDIO_SUFFIX
 local PassedDataDataStoreName = "MasterServerServicePassedData"..STUDIO_SUFFIX
 
-local LeaseSeconds = 15
-local HeartbeatInterval = 2
-local HeartbeatTimeout = 7
+-- TTL and heartbeat settings
+local LeaseSeconds = 5 -- occupied TTL
+local HeartbeatInterval = 3 -- master renews every 3s
+local HeartbeatTimeout = 6 -- if no heartbeat within 6s, try takeover
 
 local IsInitialized = false
 local IsMaster = false
@@ -45,6 +46,7 @@ local IsAlive = true
 local AuditLogEnabled = false
 local _PassedDataSaved = false
 local _cache = {}
+local ActiveMasterTasks = {}
 local PassedData = {
 	_data = {},
 	_timestamp = nil,
@@ -65,75 +67,75 @@ local OnServerShutdownCallback = nil
 
 local MasterServerService = {}
 
---[[
-	Checks if MemoryStoreService, DataStoreService, and MessagingService are available
-	
-	@return boolean -- true if all services are up, false otherwise
-]]
+local function safe(fn)
+	local ok, res = pcall(fn)
+	return ok, res
+end
+
+--// Service health check
 local function AreCoreServicesHealthy()
-	local ok, result
-	
-	ok, result = pcall(function()
+	local ok, res
+
+	ok, res = safe(function()
 		return MemoryStoreService:GetHashMap("__healthcheck__")
 	end)
-	
-	if not ok or not result then
-		warn("[MasterServerService] MemoryStoreService is down:", result)
+	if not ok or not res then
+		warn("[MasterServerService] MemoryStoreService is down:", res)
 		return false
 	end
-	
-	ok, result = pcall(function()
+
+	ok, res = safe(function()
 		return DataStoreService:GetDataStore("__healthcheck__")
 	end)
-	if not ok or not result then
-		warn("[MasterServerService] DataStoreService is down:", result)
+	if not ok or not res then
+		warn("[MasterServerService] DataStoreService is down:", res)
 		return false
 	end
-	
-	ok, result = pcall(function()
+
+	ok, res = safe(function()
 		local conn = MessagingService:SubscribeAsync("__healthcheck__", function() end)
-		if conn then
-			conn:Disconnect()
-		end
+		if conn then conn:Disconnect() end
 		return true
 	end)
-	
 	if not ok then
-		warn("[MasterServerService] MessagingService is down:", result)
+		warn("[MasterServerService] MessagingService is down:", res)
 		return false
 	end
-	
+
 	return true
 end
 
 local function IsSerializableForServices(data)
-	local function checkType(val)
+	local function checkType(val, seen)
 		local t = typeof(val)
 		if t == "function" or t == "userdata" or t == "Instance" or t == "RBXScriptConnection" then
 			return false, "Unsupported type: "..t
 		elseif t == "table" then
-			for k, v in val do
-				local ok, err = checkType(k)
+			seen = seen or {}
+			if seen[val] then return true end
+			seen[val] = true
+			for k, v in pairs(val) do
+				local ok, err = checkType(k, seen)
 				if not ok then return false, "Bad key: "..tostring(err) end
-				local ok2, err2 = checkType(v)
+				local ok2, err2 = checkType(v, seen)
 				if not ok2 then return false, "Bad value: "..tostring(err2) end
 			end
 		end
 		return true
 	end
-	
+
 	local ok, err = checkType(data)
 	if not ok then
 		return false, err
 	end
-	
+
 	local success, encoded = pcall(function()
 		return HttpService:JSONEncode(data)
 	end)
 	if not success then
 		return false, "JSONEncode failed: "..tostring(encoded)
 	end
-	
+
 	local byteLen = #encoded
 	if byteLen > 4096 * 1024 then
 		return false, "DataStoreService limit exceeded (4MB)"
@@ -142,18 +144,11 @@ local function IsSerializableForServices(data)
 	elseif byteLen > 1024 then
 		return false, "MessagingService limit exceeded (1KB)"
 	end
-	
+
 	return true
 end
 
---// PassedDataAPI
 MasterServerService.PassedData = {
-	--[[
-		Gets a value from PassedData by key
-		
-		@param key string
-		@return any
-	]]
 	GetAsync = function(key)
 		if key == "data" then
 			return PassedData._data
@@ -166,13 +161,6 @@ MasterServerService.PassedData = {
 		end
 	end,
 
-	--[[
-		Sets a value in PassedData by key
-		
-		@param key string
-		@param value any
-		@return boolean, string? -- true if successful, false and error message otherwise
-	]]
 	SetAsync = function(key, value)
 		if key == "data" then
 			local ok, err = IsSerializableForServices(value)
@@ -191,13 +179,6 @@ MasterServerService.PassedData = {
 		return true
 	end,
 
-	--[[
-		Updates a value in PassedData by key using a transform function
-		
-		@param key string
-		@param transformFn function -- function(oldValue: any): any
-		@return any, string? -- new value if successful, old value and error message otherwise
-	]]
 	UpdateAsync = function(key, transformFn)
 		local oldValue = MasterServerService.PassedData.GetAsync(key)
 		local newValue = transformFn(oldValue)
@@ -208,17 +189,8 @@ MasterServerService.PassedData = {
 		return newValue
 	end,
 
-	--[[
-		Returns all PassedData fields as a table
-		
-		@return table
-	]]
 	GetAll = function()
-		return {
-			data = PassedData._data,
-			timestamp = PassedData._timestamp,
-			from = PassedData._from
-		}
+		return {data = PassedData._data, timestamp = PassedData._timestamp, from = PassedData._from}
 	end
 }
 
@@ -227,11 +199,11 @@ local function SubscribeToTopic(topic, callback)
 		return MessagingService:SubscribeAsync(topic, function(message)
 			local data = message.Data
 			if typeof(data) == "table" then
-				callback(data)
+				pcall(function() callback(data) end)
 			end
 		end)
 	end)
-	
+
 	if success and conn then
 		return conn
 	else
@@ -243,19 +215,11 @@ end
 local Subscriptions = {}
 local function SubscribeToAllTopics()
 	Subscriptions[#Subscriptions + 1] = SubscribeToTopic(TopicElection, function(data)
+		if not data then return end
 		if data and data.candidate == ServerKey and data.master and data.master ~= ServerKey then
-			local ackPayload = {
-				master = data.master,
-				candidate = ServerKey,
-				from = ServerKey,
-				timestamp = os.time()
-			}
-			local success, err = pcall(function()
-				MessagingService:PublishAsync(TopicElectionAck, ackPayload)
-			end)
-			if not success then warn("Failed to publish ElectionAck:", err) end
-			
-			local success2, newValue = pcall(function()
+			local ackPayload = { master = data.master, candidate = ServerKey, from = ServerKey, timestamp = os.time() }
+			pcall(function() MessagingService:PublishAsync(TopicElectionAck, ackPayload) end)
+			local ok, newVal = safe(function()
 				return MasterHashMap:UpdateAsync(MasterHashMapKey, function(previous)
 					if previous == data.master then
 						return ServerKey
@@ -263,31 +227,26 @@ local function SubscribeToAllTopics()
 					return previous
 				end, LeaseSeconds)
 			end)
-			if success2 and newValue == ServerKey then
+
+			if ok and newVal == ServerKey then
 				CurrentMaster = ServerKey
 				IsMaster = true
 				if OnBecameMasterCallback then
 					OnBecameMasterCallback({reason = "election", from = data.master})
 				end
-				local success3, err3 = pcall(function()
-					MessagingService:PublishAsync(TopicTakeoverConfirm, {
-						master = data.master,
-						candidate = ServerKey,
-						from = ServerKey,
-						timestamp = os.time()
-					})
+				pcall(function()
+					MessagingService:PublishAsync(TopicTakeoverConfirm, { master = data.master, candidate = ServerKey, from = ServerKey, timestamp = os.time() })
 				end)
-				if not success3 then warn("Failed to publish TakeoverConfirm:", err3) end
 			end
 		end
 	end)
-	
+
 	Subscriptions[#Subscriptions + 1] = SubscribeToTopic(TopicElectionAck, function(data)
 		if data and data.master == ServerKey and PendingElectionCandidate and data.candidate == PendingElectionCandidate then
 			AckReceived = true
 		end
 	end)
-	
+
 	Subscriptions[#Subscriptions + 1] = SubscribeToTopic(TopicTakeoverConfirm, function(data)
 		if data and data.master == ServerKey and PendingElectionCandidate and data.candidate == PendingElectionCandidate then
 			TakeoverConfirmed = true
@@ -296,28 +255,28 @@ local function SubscribeToAllTopics()
 end
 
 local function EnsureStoresInitialized()
-	local success1, hashMap = pcall(function()
+	local success1, hashMap = safe(function()
 		return MemoryStoreService:GetHashMap(MasterHashMapName)
 	end)
-	
+
 	if not success1 then warn("Failed to get MasterHashMap:", hashMap) end
-	
-	local success2, sortedMap = pcall(function()
+
+	local success2, sortedMap = safe(function()
 		return MemoryStoreService:GetSortedMap(ServerListName)
 	end)
-	
+
 	if not success2 then warn("Failed to get ServerListSortedMap:", sortedMap) end
-	
-	local success3, dataStore = pcall(function()
+
+	local success3, dataStore = safe(function()
 		return DataStoreService:GetDataStore(AuditDataStoreName)
 	end)
-	
+
 	if not success3 then warn("Failed to get AuditDataStore:", dataStore) end
-	
+
 	if not (success1 and success2 and success3) then
 		return false
 	end
-	
+
 	MasterHashMap = hashMap
 	ServerListSortedMap = sortedMap
 	AuditDataStore = dataStore
@@ -326,7 +285,6 @@ end
 
 local function RecordAuditLog(event, details)
 	if AuditLogEnabled == false then return end
-	
 	local success, err = pcall(function()
 		AuditDataStore:UpdateAsync("AuditLog", function(prev)
 			prev = prev or {}
@@ -335,7 +293,6 @@ local function RecordAuditLog(event, details)
 			return prev
 		end)
 	end)
-	
 	if not success then warn("Failed to record audit:", err) end
 end
 
@@ -343,17 +300,17 @@ local function GetServerList(limit)
 	local success, range = pcall(function()
 		return ServerListSortedMap:GetRangeAsync(Enum.SortDirection.Ascending, limit)
 	end)
-	
+
 	if not success or not range then
 		if not success then warn("Failed to get server list:", range) end
 		return {}
 	end
-	
+
 	local out = {}
 	for _, kv in ipairs(range) do
 		out[#out + 1] = kv.key
 	end
-	
+
 	return out
 end
 
@@ -362,14 +319,28 @@ local function AddSelfToServerList()
 	local success, errorMsg = pcall(function()
 		listedServersAmount = #ServerListSortedMap:GetRangeAsync(Enum.SortDirection.Ascending, 10)
 	end)
-	
+
 	if not success then warn("Failed to get server list:", errorMsg) return end
 	if listedServersAmount >= MaxServers then return end
 	local success2, err = pcall(function()
 		ServerListSortedMap:SetAsync(ServerKey, os.time(), EntryLifetimeSeconds)
 	end)
-	
+
 	if not success2 then warn("Failed to add self to server list:", err) end
+end
+
+local function StartServerListRefreshLoop()
+	task.spawn(function()
+		while IsAlive do
+			local success, err = pcall(function()
+				ServerListSortedMap:SetAsync(ServerKey, os.time(), EntryLifetimeSeconds)
+			end)
+			if not success then
+				warn("[MasterServerService] Failed to refresh server list entry:", err)
+			end
+			task.wait(8)
+		end
+	end)
 end
 
 local function RemoveSelfFromServerList()
@@ -385,7 +356,7 @@ local function ReadMasterKey()
 	local success, val = pcall(function()
 		return MasterHashMap:GetAsync(MasterHashMapKey)
 	end)
-	
+
 	if success then
 		return val
 	else
@@ -394,15 +365,17 @@ local function ReadMasterKey()
 	end
 end
 
+-- BecomeMaster: loads passed data and starts renewal loop that uses UpdateAsync to refresh only if still master
 local function BecomeMaster(reason)
 	IsMaster = true
 	CurrentMaster = ServerKey
 	RecordAuditLog("MasterSet", {newMaster = ServerKey, reason = reason})
+
 	local successLoad, loaded = pcall(function()
 		local ds = DataStoreService:GetDataStore(PassedDataDataStoreName)
 		return ds:GetAsync("data")
 	end)
-	
+
 	if successLoad and loaded ~= nil then
 		_cache.passedData = loaded
 		PassedData._data = loaded
@@ -410,15 +383,38 @@ local function BecomeMaster(reason)
 	if OnBecameMasterCallback then
 		OnBecameMasterCallback({reason = reason, data = PassedData._data})
 	end
-	
+
 	task.spawn(function()
 		while IsMaster and IsAlive do
-			pcall(function()
-				MasterHashMap:SetAsync(MasterHashMapKey, ServerKey, LeaseSeconds)
+			local ok, newVal = safe(function()
+				return MasterHashMap:UpdateAsync(MasterHashMapKey, function(old)
+					if old == ServerKey then
+						return ServerKey
+					end
+					return old
+				end, LeaseSeconds)
 			end)
+
+			if not ok then
+				warn("[MasterServerService] Renewal failed (pcall)")
+				local cur = ReadMasterKey()
+				CurrentMaster = cur
+				IsMaster = (cur == ServerKey)
+				break
+			end
+
+			if newVal ~= ServerKey then
+				warn("[MasterServerService] Lost master during renewal. New master:", newVal)
+				CurrentMaster = newVal
+				IsMaster = (newVal == ServerKey)
+				break
+			end
+
 			pcall(function()
 				MessagingService:PublishAsync("MasterServerHeartbeat"..STUDIO_SUFFIX, {master = ServerKey, ts = os.time()})
 			end)
+			
+			-- print("MasterServerService: Heartbeat sent at " .. os.time())
 			task.wait(HeartbeatInterval)
 		end
 	end)
@@ -426,9 +422,9 @@ end
 
 local function TryBecomeMaster(reason)
 	task.wait(math.random() * 0.08)
-	local maxRetries = 3
+	local maxRetries = 5
 	for i = 1, maxRetries do
-		local success, newValue = pcall(function()
+		local success, newValue = safe(function()
 			return MasterHashMap:UpdateAsync(MasterHashMapKey, function(old)
 				if old == nil or old == "" then
 					return ServerKey
@@ -436,48 +432,93 @@ local function TryBecomeMaster(reason)
 				return old
 			end, LeaseSeconds)
 		end)
-		
-		if success and newValue == ServerKey then
-			BecomeMaster(reason)
-			return
-		elseif success then
-			CurrentMaster = newValue
-			IsMaster = (newValue == ServerKey)
-			if not IsMaster and OnBecameServerCallback then
-				OnBecameServerCallback({reason = reason})
+
+		if success then
+			if newValue == ServerKey then
+				BecomeMaster(reason)
+				return true
+			else
+				CurrentMaster = newValue
+				IsMaster = (newValue == ServerKey)
+				if not IsMaster and OnBecameServerCallback then
+					OnBecameServerCallback({reason = reason})
+				end
+				return false
 			end
-			return
 		else
 			task.wait(0.05 * i)
 		end
 	end
+	return false
 end
 
+-- Heartbeat watcher: listens for heartbeats and triggers takeover when absent
 local lastHeartbeat = os.time()
 local function StartHeartbeatWatcher()
 	SubscribeToTopic("MasterServerHeartbeat"..STUDIO_SUFFIX, function(data)
-		if data and data.master then
-			if CurrentMaster == nil or CurrentMaster == "" then
-				CurrentMaster = data.master
-			end
-			if data.master == CurrentMaster then
-				lastHeartbeat = os.time()
+		if not data or not data.master then return end
+		if CurrentMaster == nil or CurrentMaster == "" then
+			CurrentMaster = data.master
+			lastHeartbeat = os.time()
+			return
+		end
+
+		if data.master ~= CurrentMaster then
+			local success, authoritative = safe(function()
+				return MasterHashMap:GetAsync(MasterHashMapKey)
+			end)
+
+			if success then
+				if authoritative == data.master then
+
+					CurrentMaster = data.master
+					IsMaster = (CurrentMaster == ServerKey)
+					lastHeartbeat = os.time()
+					return
+				else
+					if authoritative == ServerKey then
+						return
+					else
+						warn("[MasterServerService] Master conflict detected. Clearing current master and attempting takeover.")
+						CurrentMaster = nil
+						IsMaster = false
+						lastHeartbeat = 0
+						-- attempt to become master
+						task.spawn(function() TryBecomeMaster("master_conflict") end)
+						return
+					end
+				end
+			else
+				warn("[MasterServerService] Could not read authoritative master during conflict; attempting takeover")
+				CurrentMaster = nil
+				IsMaster = false
+				lastHeartbeat = 0
+				task.spawn(function() TryBecomeMaster("master_conflict") end)
+				return
 			end
 		end
+
+		if data.master == CurrentMaster then
+			lastHeartbeat = os.time()
+		end
 	end)
-	
+
 	task.spawn(function()
 		while IsAlive do
-			task.wait(3)
+			task.wait(1)
 			if CurrentMaster and not IsMaster and os.time() - lastHeartbeat > HeartbeatTimeout then
-				local successGet, current = pcall(function()
+				local successGet, current = safe(function()
 					return MasterHashMap:GetAsync(MasterHashMapKey)
 				end)
-				if successGet and (current == nil or current == "") then
-					TryBecomeMaster("heartbeat_timeout")
+				if successGet then
+					if current == nil or current == "" then
+						TryBecomeMaster("heartbeat_timeout")
+					else
+						CurrentMaster = current
+						lastHeartbeat = os.time()
+					end
 				else
-					CurrentMaster = current
-					lastHeartbeat = os.time()
+					TryBecomeMaster("heartbeat_timeout_read_fail")
 				end
 			end
 		end
@@ -485,12 +526,7 @@ local function StartHeartbeatWatcher()
 end
 
 local function AttemptHandshakeWithCandidate(candidateId)
-	local handshakePayload = {
-		type = "HandshakeRequest",
-		candidateId = candidateId,
-		fromServerId = ServerKey,
-		timestamp = os.time()
-	}
+	local handshakePayload = { type = "HandshakeRequest", candidateId = candidateId, fromServerId = ServerKey, timestamp = os.time() }
 	MasterServerService.Publish("ServerHandshake", handshakePayload)
 end
 
@@ -499,17 +535,16 @@ local function HandoffMasterOnShutdown()
 	if _PassedDataSaved == false then
 		PassedData._data = nil
 	end
-	
+
 	local serverList = GetServerList(10)
 	if #serverList > 1 then
 		local selectedServer
-		while selectedServer == nil do
-			local randomServer = serverList[math.random(#serverList)]
-			local IsSerializable, reason = IsSerializableForServices(PassedData._data)
-			if IsSerializable == false then
-				PassedData._data = nil
-			end
+		for _, randomServer in ipairs(serverList) do
 			if randomServer ~= ServerKey then
+				local IsSerializable, reason = IsSerializableForServices(PassedData._data)
+				if IsSerializable == false then
+					PassedData._data = nil
+				end
 				pcall(function()
 					MessagingService:PublishAsync(randomServer, {
 						type = "Handoff",
@@ -521,7 +556,6 @@ local function HandoffMasterOnShutdown()
 				selectedServer = randomServer
 				break
 			end
-			task.wait(0.05)
 		end
 	else
 		local DataStore = DataStoreService:GetDataStore(PassedDataDataStoreName)
@@ -538,27 +572,22 @@ local function HandoffMasterOnShutdown()
 	end
 end
 
---[[
-	Internal initialization logic for MasterServerService
-	Checks core service health before proceeding with election and store setup
-	If any core service is down, waits and retries every 60 seconds
-	
-	@return boolean -- true if initialization succeeded, false otherwise
-]]
 local function InitializeInternal()
 	while not AreCoreServicesHealthy() do
 		warn("[MasterServerService] One or more core services are down. Will retry in 60 seconds.")
 		task.wait(60)
 	end
-	
+
 	if not EnsureStoresInitialized() then
 		return false
 	end
-	
+
 	SubscribeToAllTopics()
 	AddSelfToServerList()
-	
+	StartServerListRefreshLoop()
+
 	SubscribeToTopic(ServerKey, function(data)
+		if not data then return end
 		if data.type == "Handoff" then
 			local prev = data.previousMasterId
 			local newMaster = data.newMasterId
@@ -587,10 +616,10 @@ local function InitializeInternal()
 			end
 		end
 	end)
-	
+
 	local listcount = #GetServerList(10)
 	if listcount == 1 then
-		local success, newValue = pcall(function()
+		local success, newValue = safe(function()
 			return MasterHashMap:UpdateAsync(MasterHashMapKey, function(old)
 				if old == nil or old == "" then
 					return ServerKey
@@ -608,17 +637,14 @@ local function InitializeInternal()
 	else
 		local master = ReadMasterKey()
 		CurrentMaster = master
+		IsMaster = (master == ServerKey)
 	end
-	
+
 	StartHeartbeatWatcher()
 	return true
 end
 
---[[
-	Initializes the MasterServerService
-	
-	@return table -- {success: boolean, isMaster: boolean, masterId: string}
-]]
+-- Public API
 function MasterServerService.Initialize()
 	task.spawn(function()
 		if IsInitialized then
@@ -631,9 +657,9 @@ function MasterServerService.Initialize()
 				if OnServerShutdownCallback then
 					task.spawn(OnServerShutdownCallback)
 				end
-				task.wait(0.1)
+				task.wait(0.05)
 				task.spawn(HandoffMasterOnShutdown)
-				local ServerAliveTime = 5
+				local ServerAliveTime = 2
 				local startTime = tick()
 				while tick() - startTime < ServerAliveTime do
 					task.wait(1)
@@ -642,64 +668,34 @@ function MasterServerService.Initialize()
 				RemoveSelfFromServerList()
 			end
 		end)
-		
-		local success = InitializeInternal()
+
+		local ok = InitializeInternal()
 		IsInitialized = true
-		return {success = success, isMaster = IsMaster, masterId = CurrentMaster}
+		print("[MasterServerService] Master server initialized. Is master:", IsMaster, "Master id:", CurrentMaster)
+		return {success = ok, isMaster = IsMaster, masterId = CurrentMaster}
 	end)
 end
 
---[[
-	Returns true if the server is the master server, false otherwise
-	
-	@return boolean
-]]
 function MasterServerService.IsMaster()
 	return IsMaster
 end
 
---[[
-	Returns the master server id
-	
-	@return string | nil
-]]
 function MasterServerService.GetMasterId()
 	return CurrentMaster
 end
 
---[[
-	Returns the Server list
-	
-	@return table -- array of server ids (string)
-]]
 function MasterServerService.GetServerList()
 	return GetServerList(10)
 end
 
---[[
-	Publishes a message to all servers
-	
-	@param topic string
-	@param payload any
-]]
 function MasterServerService.Publish(topic, payload)
 	local success, err = pcall(function()
-		MessagingService:PublishAsync(TopicBroadcastPrefix..topic, {
-			from = ServerKey,
-			payload = payload,
-			timestamp = os.time()
-		})
+		MessagingService:PublishAsync(TopicBroadcastPrefix..topic, { from = ServerKey, payload = payload, timestamp = os.time() })
 	end)
-	
+
 	if not success then warn("Failed to publish broadcast:", err) end
 end
 
---[[
-	Subscribes to a topic
-	
-	@param topic string
-	@param callback function -- function(from: string, payload: any, timestamp: number)
-]]
 function MasterServerService.Subscribe(topic, callback)
 	SubscribeToTopic(TopicBroadcastPrefix..topic, function(data)
 		if data then
@@ -708,74 +704,36 @@ function MasterServerService.Subscribe(topic, callback)
 	end)
 end
 
---[[
-	Forces a handoff to another server
-	
-	@param targetId string
-	@return boolean -- true if handoff attempted, false otherwise
-]]
 function MasterServerService.ForceReassign(targetId)
 	if not IsMaster or not targetId or targetId == ServerKey then
 		return false
 	end
-	
 	return AttemptHandshakeWithCandidate(targetId)
 end
 
---[[
-	Returns the current status of the module
-	
-	@return table -- {alive: boolean, isMaster: boolean, masterId: string, listCount: number}
-]]
 function MasterServerService.Status()
-	return {
-		alive = IsAlive,
-		isMaster = IsMaster,
-		masterId = CurrentMaster,
-		listCount = #GetServerList(10)
-	}
+	return { alive = IsAlive, isMaster = IsMaster, masterId = CurrentMaster, listCount = #GetServerList(10) }
 end
 
---[[
-	Sets the callback for when the server becomes the master server
-	
-	@param fn function -- function(info: table)
-]]
 function MasterServerService.OnBecameMaster(fn)
 	OnBecameMasterCallback = fn
 end
 
---[[
-	Sets the callback for when the server loses master status
-	
-	@param fn function -- function(info: table)
-]]
 function MasterServerService.OnBecameServer(fn)
 	OnBecameServerCallback = fn
 end
 
---[[
-	Sets the callback for when the server shuts down
-	
-	@param fn function -- function()
-]]
 function MasterServerService.OnServerShutdown(fn)
 	OnServerShutdownCallback = fn
 end
 
---[[
-	Sets the passed data to be sent to new master server
-	
-	@param data table
-	@return boolean, string? -- true if successful, false and error message otherwise
-]]
 function MasterServerService.SetPassedData(data)
 	local ok, err = IsSerializableForServices(data)
 	if not ok then
 		warn("[SetPassedData] Data failed sanity check: "..tostring(err))
 		return false, err
 	end
-	
+
 	PassedData._data = data
 	PassedData._timestamp = os.time()
 	PassedData._from = ServerKey
@@ -786,75 +744,89 @@ function MasterServerService.SetPassedData(data)
 			local ds = DataStoreService:GetDataStore(PassedDataDataStoreName)
 			ds:SetAsync("data", data)
 		end)
-		if not success then
-			warn("[SetPassedData] Failed to persist PassedData to DataStore:", perr)
-		end
+		if not success then warn("[SetPassedData] Failed to persist PassedData to DataStore:", perr) end
 	else
 		if CurrentMaster and CurrentMaster ~= "" then
 			local success, perr = pcall(function()
-				MessagingService:PublishAsync(CurrentMaster, {
-					type = "PassedDataUpdate",
-					Data = data,
-					from = ServerKey,
-					timestamp = PassedData._timestamp
-				})
+				MessagingService:PublishAsync(CurrentMaster, { type = "PassedDataUpdate", Data = data, from = ServerKey, timestamp = PassedData._timestamp })
 			end)
-			if not success then
-				warn("[SetPassedData] Failed to send PassedData to master:", perr)
-			end
+			if not success then warn("[SetPassedData] Failed to send PassedData to master:", perr) end
 		end
 	end
-	
+
 	return true
 end
 
---[[
-	Audit API for master server
-	
-	@return table -- Audit API
-]]
 function MasterServerService.AuditService()
 	local Audit = {}
-	
-	--[[
-		Gets the audit logs
-		
-		@return table -- array of audit log entries
-	]]
 	function Audit.GetAuditLogs()
 		return AuditDataStore:GetAsync("AuditLogs") or {}
 	end
-	
-	--[[
-		Enables or disables audit logging
-		
-		@param enable boolean -- true to enable, false to disable
-		@return boolean|string -- true if successful, or false and error message
-	]]
 	function Audit.EnableAuditLogging(enable)
-		if type(enable) ~= "boolean" then
-			return false, "Argument must be a boolean"
-		end
+		if type(enable) ~= "boolean" then return false, "Argument must be a boolean" end
 		AuditLogEnabled = enable
-		
 		return true
 	end
-	
-	--[[
-		Clears all audit logs
-		
-		@return nil
-	]]
 	function Audit.CleanupAuditLogs()
-		local success, err = pcall(function()
-			AuditDataStore:SetAsync("AuditLogs", {})
-		end)
-		if not success then
-			warn("Failed to cleanup audit logs:", err)
-		end
+		local success, err = pcall(function() AuditDataStore:SetAsync("AuditLogs", {}) end)
+		if not success then warn("Failed to cleanup audit logs:", err) end
 	end
-	
 	return Audit
 end
+
+-- DebugService: Reset all services data (MemoryStoreService, DataStoreService)
+local DebugService = {}
+
+function DebugService.ResetAllServicesData()
+	local ok1, hashMap = pcall(function()
+		return MemoryStoreService:GetHashMap(MasterHashMapName)
+	end)
+	if ok1 and hashMap then
+		pcall(function()
+			hashMap:RemoveAsync(MasterHashMapKey)
+		end)
+	end
+
+	local ok2, sortedMap = pcall(function()
+		return MemoryStoreService:GetSortedMap(ServerListName)
+	end)
+	if ok2 and sortedMap then
+		pcall(function()
+			local range = sortedMap:GetRangeAsync(Enum.SortDirection.Ascending, MaxServers)
+			for _, kv in ipairs(range) do
+				sortedMap:RemoveAsync(kv.key)
+			end
+		end)
+	end
+	
+	local ok3, auditStore = pcall(function()
+		return DataStoreService:GetDataStore(AuditDataStoreName)
+	end)
+	if ok3 and auditStore then
+		pcall(function()
+			auditStore:SetAsync("AuditLogs", {})
+			auditStore:SetAsync("AuditLog", {})
+		end)
+	end
+
+	local ok4, passedDataStore = pcall(function()
+		return DataStoreService:GetDataStore(PassedDataDataStoreName)
+	end)
+	if ok4 and passedDataStore then
+		pcall(function()
+			passedDataStore:SetAsync("data", nil)
+		end)
+	end
+	
+	PassedData._data = {}
+	PassedData._timestamp = nil
+	PassedData._from = nil
+	_cache.passedData = nil
+
+	warn("[DebugService] All services data have been reset.")
+	return true
+end
+
+MasterServerService.DebugService = DebugService
 
 return MasterServerService
